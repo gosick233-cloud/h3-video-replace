@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.local/
+config.local.json
+.env
+.env.*
+outputs/
+work/
+*.log
+*.mp4
+*.mkv
+*.webm
+*.wav
+*.mp3
+*.safetensors
+*.ckpt
