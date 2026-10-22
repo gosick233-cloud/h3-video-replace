@@ -1,4 +1,4 @@
-"""Inspect an explicitly supplied workflow and store reviewed local defaults."""
+"""Inspect user-supplied H3 workflows; bind actual API inputs, not versioned nodes."""
 from __future__ import annotations
 
 import copy
@@ -6,165 +6,176 @@ from pathlib import Path
 import re
 
 from common import read_json
+from workflow_graph import api_graph, execution_graph, input_schemas, is_link, widget_values
 
-EASY = "gosick_233_MiniMaxH3EasyV114"
-MOTION = "gosick_233_H3MotionBlurSwitchV114"
 DEFAULT_PROFILE = Path(__file__).resolve().parents[1] / ".local" / "config.json"
+SOURCES = {"prompt", "media", "reference_video", "reference_images", "seconds", "frames",
+           "original_frames", "fps", "width", "height", "aspect_ratio", "output_prefix", "seed"}
 
 
-def widgets(node):
-    names = [entry.get("widget", {}).get("name", entry["name"])
-             for entry in node.get("inputs", []) if entry.get("widget")]
-    values = dict(zip(names, node.get("widgets_values") or []))
-    values.update(node.get("widgets_values_named") or {})
-    return values
+def document_format(document):
+    return "ui" if isinstance(document.get("nodes"), list) else "api"
 
 
-def set_widget(node, name, value):
-    names = [entry.get("widget", {}).get("name", entry["name"])
-             for entry in node.get("inputs", []) if entry.get("widget")]
-    node.setdefault("widgets_values_named", {})[name] = value
-    if name in names:
-        values = node.setdefault("widgets_values", [])
-        while len(values) <= names.index(name):
-            values.append(None)
-        values[names.index(name)] = value
+def load_execution(profile, schemas=None):
+    document = read_json(profile["workflow"])
+    roots = [str(n) for n in profile["output_node_ids"] + profile.get("extra_output_node_ids", [])]
+    if document_format(document) == "api":
+        return api_graph(document), document
+    controls = list(profile["parameters"].values()) + profile["bindings"]
+    roots += [str(t["node_id"]) for entry in controls for t in entry["targets"]]
+    return execution_graph(document, schemas, profile.get("ui_widget_map"), list(dict.fromkeys(roots))), document
 
 
-def node_by_id(workflow, ident):
-    matches = [node for node in workflow["nodes"] if str(node["id"]) == str(ident)]
-    if len(matches) != 1:
-        raise ValueError(f"Workflow node {ident} is missing or ambiguous")
-    return matches[0]
-
-
-def target(node, widget):
-    return {"node_id": str(node["id"]), "widget": widget}
-
-
-def effective_control(workflow, node, name, seen=None):
-    """A linked widget is controlled by its upstream value, not its UI label."""
-    seen = set() if seen is None else seen
-    if str(node["id"]) in seen:
-        raise ValueError("Cyclic parameter binding")
-    entry = next((e for e in node.get("inputs", []) if e["name"] == name), {})
-    link_id = entry.get("link")
-    if link_id is None:
-        return node, name
-    link = next(link for link in workflow["links"] if link[0] == link_id)
-    upstream = node_by_id(workflow, link[1])
-    names = list(widgets(upstream))
-    if len(names) != 1:
-        return None
-    return effective_control(workflow, upstream, names[0], seen | {str(node["id"])})
-
-
-def inspect_workflow(comfyui_root, workflow_path, comfy_url=None):
+def inspect_workflow(comfyui_root, workflow_path, comfy_url=None, schemas=None):
     root, path = Path(comfyui_root).resolve(), Path(workflow_path).resolve()
     if not root.is_dir():
         raise ValueError("Provide the user's existing ComfyUI root directory")
-    workflow = read_json(path)
-    if not isinstance(workflow.get("nodes"), list):
-        raise ValueError("Provide an H3 v1.14 UI workflow JSON, not an API-format export")
-    easy = [n for n in workflow["nodes"] if n["type"] == EASY]
-    if len(easy) != 1:
-        raise ValueError("This adapter requires one H3 v1.14 Easy node; inspect/adapt other node families first")
-    easy = easy[0]
-    parameters = {}
-    candidates = []
-    # List actual controls so an agent can ask the user, including custom graphs.
-    control_words = re.compile(r"step|sigma|resolution|width|height|scale|strength|attention|tile|blur|步|分辨率|倍率|模糊|分块|稀疏", re.I)
-    for node in workflow["nodes"]:
-        for name, value in widgets(node).items():
-            if isinstance(value, (int, float, bool)) or control_words.search(name + " " + node.get("title", "")):
-                candidates.append({**target(node, name), "title": node.get("title", node["type"]),
-                                   "node_type": node["type"], "value": value})
-
-    def add(key, node, name):
-        resolved = effective_control(workflow, node, name)
-        if resolved is None:
-            return
-        node, name = resolved
-        values = widgets(node)
-        if name in values:
-            parameters[key] = {"value": values[name], "targets": [target(node, name)]}
-
-    for name in ["resolution", "width", "height", "second_pass_enabled"]:
-        add("first_resolution" if name == "resolution" else name, easy, name)
-    # Labels are suggestions only. Unrecognized controls remain in candidates
-    # for explicit selection; no node IDs or sampling values are assumed.
-    labels = {"first_steps": {"一采步数", "first steps", "first pass steps"},
-              "second_steps": {"二采步数", "second steps", "second pass steps"},
-              "upscale": {"二采倍率", "upscale", "upscale factor", "second pass scale"}}
-    for key, names in labels.items():
-        matches = [n for n in workflow["nodes"] if n.get("title", "").strip().lower() in names]
-        if len(matches) == 1:
-            add(key, matches[0], "value")
-    motions = [n for n in workflow["nodes"] if n["type"] == MOTION]
-    if len(motions) == 1:
-        for key, name in [("first_motion_deblur", "一采高动态减少模糊"),
-                          ("second_motion_deblur", "二采高动态减少模糊")]:
-            add(key, motions[0], name)
-    return {
-        "profile": {"schema_version": 1, "comfyui_root": str(root), "workflow": str(path),
-                    "comfy_url": comfy_url, "input_directory": str(root / "input"),
-                    "easy_node_id": str(easy["id"]), "reference_short_edge": None, "parameters": parameters},
-        "adjustable_controls": candidates,
-        "review": "Ask the user which defaults to use before saving. Unrecognized controls require explicit node/widget targets.",
-    }
+    document = read_json(path)
+    kind = document_format(document)
+    controls, unresolved, outputs = [], [], []
+    if kind == "api":
+        graph = api_graph(document)
+        consumed = {v[0] for n in graph.values() for v in n["inputs"].values() if is_link(v, graph)}
+        for ident, node in graph.items():
+            schema = (schemas or {}).get(node["class_type"], {})
+            if schema.get("output_node") or ident not in consumed:
+                outputs.append({"node_id": ident, "node_type": node["class_type"],
+                                "title": node.get("_meta", {}).get("title", node["class_type"])})
+            specs = input_schemas(schema, node["inputs"])
+            for name, value in node["inputs"].items():
+                if not is_link(value, graph):
+                    controls.append(control_row(ident, node["class_type"], node.get("_meta", {}).get("title"), name, value, specs))
+    else:
+        for node in document["nodes"]:
+            ident = str(node["id"])
+            schema = (schemas or {}).get(node["type"], {})
+            try:
+                values = widget_values(node, schema or None)
+            except ValueError as exc:
+                unresolved.append({"node_id": ident, "node_type": node["type"], "reason": str(exc),
+                                   "widgets_values": node.get("widgets_values")})
+                continue
+            specs = input_schemas(schema, values)
+            for name, value in values.items():
+                linked = next((e.get("link") for e in node.get("inputs", []) if e["name"] == name), None)
+                if linked is None:
+                    controls.append(control_row(ident, node["type"], node.get("title"), name, value, specs))
+            if schema.get("output_node") or not any(o.get("links") for o in node.get("outputs", [])):
+                outputs.append({"node_id": ident, "node_type": node["type"], "title": node.get("title", node["type"])})
+    return {"profile": {
+        "schema_version": 2, "comfyui_root": str(root), "workflow": str(path), "comfy_url": comfy_url,
+        "input_directory": str(root / "input"), "reference_short_edge": None,
+        "parameters": {}, "bindings": [], "output_node_ids": [], "extra_output_node_ids": [],
+        "video_output_index": None, "ui_widget_map": {}},
+        "workflow_format": kind, "adjustable_controls": controls,
+        "output_candidates": outputs, "unresolved_ui_widgets": unresolved,
+        "review": "Ask the user to choose defaults, runtime bindings and final video outputs; no H3 workflow version is required."}
 
 
-def validate_profile(profile):
+def control_row(ident, kind, title, name, value, specs):
+    row = {"node_id": str(ident), "input": name, "node_type": kind, "title": title or kind, "value": value}
+    if name in specs:
+        spec = specs[name][0]
+        if isinstance(spec[0], list):
+            row["choices"] = spec[0]
+        elif len(spec) > 1 and isinstance(spec[1], dict):
+            row["options"] = {k: v for k, v in spec[1].items() if k in ("min", "max", "step")}
+    matches = []
+    for role, pattern in [("prompt", r"prompt|positive|text|提示"), ("media", r"manifest|assets"),
+                          ("reference_video", r"video|视频"), ("reference_images", r"image|图片|参考图"),
+                          ("seconds", r"seconds|duration|时长"), ("frames", r"frames|length|帧数"),
+                          ("fps", r"fps|frame_rate|帧率"), ("output_prefix", r"filename_prefix|output_prefix")]:
+        if re.search(pattern, name, re.I):
+            matches.append(role)
+    row["suggested_roles"] = matches
+    return row
+
+
+def check_target(graph, target):
+    ident, name = str(target["node_id"]), target["input"]
+    if ident not in graph or name not in graph[ident]["inputs"]:
+        raise ValueError(f"Mapping target {ident}.{name} is absent from the supplied execution graph")
+    if is_link(graph[ident]["inputs"][name], graph):
+        raise ValueError(f"{ident}.{name}: select the upstream control, not a linked input")
+    value = graph[ident]["inputs"][name]
+    for key in target.get("path", []):
+        value = value[key]
+    return ident, name
+
+
+def set_target(graph, target, value):
+    ident, name = check_target(graph, target)
+    path = target.get("path", [])
+    if not path:
+        graph[ident]["inputs"][name] = copy.deepcopy(value)
+    else:
+        container = graph[ident]["inputs"][name]
+        for key in path[:-1]:
+            container = container[key]
+        container[path[-1]] = copy.deepcopy(value)
+
+
+def validate_profile(profile, schemas=None):
     from local_h3 import LocalComfy
+    if profile.get("schema_version") != 2:
+        raise ValueError("Reinitialize this profile: supply the user's H3 workflow and confirm its input/output bindings")
     LocalComfy(profile["comfy_url"])
-    if not Path(profile["comfyui_root"]).is_dir():
-        raise ValueError("ComfyUI root does not exist")
-    if not Path(profile["input_directory"]).is_dir():
-        raise ValueError("Confirm the actual input directory before saving")
-    workflow = read_json(profile["workflow"])
-    easy = node_by_id(workflow, profile["easy_node_id"])
-    if easy["type"] != EASY:
-        raise ValueError("The selected node is not an H3 v1.14 Easy node")
+    if not Path(profile["comfyui_root"]).is_dir() or not Path(profile["input_directory"]).is_dir():
+        raise ValueError("Confirm the existing ComfyUI root and actual input directory")
     edge = profile["reference_short_edge"]
     if edge is not None and (type(edge) is not int or edge < 2 or edge % 2):
-        raise ValueError("Reference short edge must be an even positive pixel count, or null to retain source size")
+        raise ValueError("Reference short edge must be an even pixel count or null")
+    if not profile["output_node_ids"]:
+        raise ValueError("Ask the user which nodes produce the final video")
+    if document_format(read_json(profile["workflow"])) == "ui" and schemas is None:
+        schemas = LocalComfy(profile["comfy_url"]).request("/object_info")
+    graph, _ = load_execution(profile, schemas)
+    for ident in profile["output_node_ids"] + profile.get("extra_output_node_ids", []):
+        if str(ident) not in graph:
+            raise ValueError(f"Output node {ident} is absent from the supplied workflow")
     seen = set()
-    for name, parameter in profile["parameters"].items():
-        if not parameter.get("targets"):
-            raise ValueError(f"{name}: choose at least one actual workflow control")
-        for binding in parameter["targets"]:
-            node = node_by_id(workflow, binding["node_id"])
-            if binding["widget"] not in widgets(node):
-                raise ValueError(f"{name}: widget is absent from the supplied workflow")
-            entry = next((e for e in node.get("inputs", []) if e["name"] == binding["widget"]), {})
-            if entry.get("link") is not None:
-                raise ValueError(f"{name}: bind the upstream source; this widget is overridden by a link")
-            key = (str(node["id"]), binding["widget"])
+    for entry in list(profile["parameters"].values()) + profile["bindings"]:
+        if not entry.get("targets"):
+            raise ValueError("Choose actual input targets for each parameter/binding")
+        for target in entry["targets"]:
+            ident, name = check_target(graph, target)
+            key = (ident, name, tuple(target.get("path", [])))
             if key in seen:
-                raise ValueError(f"{name}: the same widget is bound twice")
+                raise ValueError(f"Duplicate parameter/runtime binding for {ident}.{name}")
             seen.add(key)
-    if "first_resolution" not in profile["parameters"]:
-        raise ValueError("Confirm the first-pass resolution control")
+    if not profile["bindings"]:
+        raise ValueError("Confirm how this H3 workflow receives the per-clip prompt and reference assets")
+    for entry in profile["bindings"]:
+        if entry["source"] not in SOURCES:
+            raise ValueError("Unknown runtime source: " + entry["source"])
+        if entry.get("encoding", "value") not in ("value", "json"):
+            raise ValueError("Use value or json encoding")
+        if entry.get("path_format", "relative") not in ("relative", "absolute"):
+            raise ValueError("Use relative or absolute file paths")
+        if entry.get("path_format") == "absolute" and entry["source"] not in ("reference_video", "reference_images"):
+            raise ValueError("Absolute paths apply to reference video/image inputs")
+        if "index" in entry and (type(entry["index"]) is not int or entry["index"] < 0):
+            raise ValueError("Reference image index must be a nonnegative integer")
     return profile
 
 
 def load_profile(path=None):
     path = Path(path) if path else DEFAULT_PROFILE
     if not path.is_file():
-        raise ValueError("First use: ask for ComfyUI path and workflow, inspect controls, ask for defaults, then run setup.py save")
-    return validate_profile(read_json(path))
+        raise ValueError("First use: ask for ComfyUI path and H3 workflow, inspect controls, then confirm defaults and bindings")
+    profile = read_json(path)
+    if profile.get("schema_version") != 2:
+        raise ValueError("Reinitialize the H3 workflow bindings with setup.py")
+    return profile
 
 
 def task_settings(profile):
-    settings = copy.deepcopy(profile)
-    for name, parameter in profile["parameters"].items():
-        settings[name] = parameter["value"]
-    return settings
+    return copy.deepcopy(profile)
 
 
-def apply_parameters(workflow, settings):
-    for name, parameter in settings["parameters"].items():
-        value = settings.get(name, parameter["value"])
-        for binding in parameter["targets"]:
-            set_widget(node_by_id(workflow, binding["node_id"]), binding["widget"], value)
-    return workflow
+def apply_parameters(graph, settings):
+    for entry in settings["parameters"].values():
+        for target in entry["targets"]:
+            set_target(graph, target, entry["value"])
+    return graph

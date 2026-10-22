@@ -4,7 +4,9 @@ from copy import deepcopy
 from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from local_h3 import EASY, FIRST_SAVE, SECOND_SAVE
+EASY = "ExampleH3Inputs"
+FIRST_SAVE = "ExampleFirstVideoSave"
+SECOND_SAVE = "ExampleSecondVideoSave"
 
 
 def fixture(second=True):
@@ -49,8 +51,8 @@ def fixture(second=True):
     connect(first, 0, first_save, 'video', 'VIDEO')
     second_save = node(519, SECOND_SAVE, {'filename_prefix': 'original', '开启保存二采': second}, ['VIDEO'])
     connect(second_node, 0, second_save, 'video', 'VIDEO')
-    unload = node(602, 'gosick_233_MiniMaxH3AutoUnload', {}, [])
-    connect(second_save, 0, unload, 'video', 'VIDEO')
+    unload = node(602, 'ExampleAfterGeneration', {}, [])
+    connect(second_save if second else first_save, 0, unload, 'video', 'VIDEO')
     schemas = {}
     for n in nodes:
         required = {}
@@ -69,5 +71,30 @@ def fixture(second=True):
             required['ref_image_size'] = [['1k', '2k'], {}]
         schemas[n['type']] = {'input': {'required': required},
             'output': [o['type'] for o in n['outputs']],
-            'output_node': n['type'] in [FIRST_SAVE, SECOND_SAVE, 'gosick_233_MiniMaxH3AutoUnload']}
+            'output_node': n['type'] in [FIRST_SAVE, SECOND_SAVE, 'ExampleAfterGeneration']}
     return {'nodes': nodes, 'links': links, 'extra': {}}, schemas
+
+
+def reviewed_profile(report, second=True):
+    """Simulated second-round user answers, not shipped production defaults."""
+    profile = deepcopy(report['profile'])
+    def param(value, ident, name):
+        return {'value': value, 'targets': [{'node_id': str(ident), 'input': name}]}
+    profile['parameters'] = {
+        'resolution': param('720P', 83, 'resolution'),
+        'first_steps': param(9, 121, 'value'),
+        'second_steps': param(3, 174, 'value'),
+        'upscale': param(1.5, 215, 'value'),
+        'reference_image_size': param('2k', 83, 'ref_image_size'),
+    }
+    def binding(source, ident, name, **extra):
+        return {'source': source, 'targets': [{'node_id': str(ident), 'input': name}], **extra}
+    profile['bindings'] = [
+        binding('prompt', 83, 'prompt'), binding('media', 83, 'media_manifest', encoding='json'),
+        binding('seconds', 83, 'seconds'), binding('fps', 83, 'fps'),
+        {'source': 'output_prefix', 'targets': [
+            {'node_id': '487', 'input': 'filename_prefix'}, {'node_id': '519', 'input': 'filename_prefix'}]},
+    ]
+    profile['output_node_ids'] = ['519' if second else '487']
+    profile['extra_output_node_ids'] = ['602']
+    return profile

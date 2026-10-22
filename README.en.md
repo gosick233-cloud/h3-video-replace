@@ -18,10 +18,12 @@ the user's H3 models and custom nodes. Only Python's standard library is needed.
 Windows users should use PowerShell 7. Install the repository as a skill folder
 named `h3-video-replace`, or give its `SKILL.md` path to your assistant.
 
-The current execution adapter supports an H3 v1.14 **UI workflow JSON** with one
-`gosick_233_MiniMaxH3EasyV114` node. Node IDs may differ, and custom controls can
-be explicitly bound. It does not claim to execute arbitrary model workflows or
-API-format exports. Models and ComfyUI nodes are not bundled or installed.
+Users supply their own working **H3 workflow**, without a required version,
+node family, or node IDs. API execution graphs are supported directly; UI
+workflows are converted using the local node schemas. If custom UI serialization
+is ambiguous, provide an API export of the same workflow. The six-section H3
+prompts, 24fps reference timeline and `17*k+5` frame padding remain unchanged.
+Models and ComfyUI nodes are not bundled or installed.
 
 ## Two-stage first-use setup
 
@@ -31,7 +33,7 @@ API-format exports. Models and ComfyUI nodes are not bundled or installed.
    node/widget targets. This produces a report, not an active configuration.
 3. **Ask again:** confirm the desired defaults for the controls present in that
    workflow, such as resolution, sampling steps, second-pass enable/scale/steps,
-   and motion deblur. Resolve ambiguous custom controls before binding them.
+   and motion deblur. Resolve ambiguous custom controls before binding them. Confirm the actual prompt, reference-video/image, duration and final-video output mappings as well.
 4. Confirm the local service URL, real input directory, and whether reference
    clips should be resized to a chosen short edge or retain their source size.
 5. Only after confirmation, save `.local/config.json`. Reinitialize when the
@@ -96,7 +98,8 @@ forensics script, writes the actual shot analysis and full prompts.
 The `scripts/` directory contains setup/configuration, visual forensics,
 preparation, workflow compilation, serial execution and a background launcher.
 `references/` holds the analysis/prompt rules and binding documentation.
-`tests/` uses synthetic workflows and temporary FFmpeg media, with a simulated
+`workflow_graph.py` handles version-independent UI/API graph conversion.
+`tests/` uses unrelated synthetic H3 node families and temporary FFmpeg media, with a simulated
 backend; tests do not submit GPU work.
 
 ```text

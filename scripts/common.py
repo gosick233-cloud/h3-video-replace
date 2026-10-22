@@ -54,7 +54,7 @@ def decode_check(path):
 
 
 def generation_frames(original, fps):
-    # v1.14 clamps seconds >= 1 and snaps length to 17*k+5. Pick an exact
+    # H3 clamps seconds >= 1 and snaps length to 17*k+5. Pick an exact
     # legal length at or above the original, rather than its nearest value.
     minimum = max(original, math.ceil(float(Fraction(fps))), 5)
     return max(0, math.ceil((minimum - 5) / 17)) * 17 + 5

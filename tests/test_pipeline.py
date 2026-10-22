@@ -16,7 +16,8 @@ import local_h3
 import workflow_config as config
 import forensic
 import batch_h3
-from fixtures import fixture
+from fixtures import fixture, reviewed_profile
+from workflow_graph import execution_graph, validate_graph
 
 
 def prompt():
@@ -59,9 +60,9 @@ class FakeComfy:
                 previous = self.jobs[self.posted[-1]]['segment']
                 assert common.segment_paths(self.root, self.task, previous)['result'].exists()
             graph = data['prompt']
-            kind = local_h3.SECOND_SAVE if any(n['class_type'] == local_h3.SECOND_SAVE for n in graph.values()) else local_h3.FIRST_SAVE
-            saver, node = next((k, n) for k, n in graph.items() if n['class_type'] == kind)
-            number = node['inputs']['filename_prefix'].split('/')[-2]
+            saver = self.task['settings']['output_node_ids'][0]
+            node = graph[saver]
+            number = node['inputs']['filename_prefix'].split('/')[-1]
             segment = next(s for s in self.task['segments'] if s['id'] == number)
             ident = f'job-{len(self.posted)}'
             self.jobs[ident] = {'segment': segment, 'saver': saver}
@@ -90,8 +91,8 @@ class PipelineTests(unittest.TestCase):
         self.workflow, self.schemas = fixture()
         self.workflow_file = self.base / 'workflow.json'
         common.write_json(self.workflow_file, self.workflow)
-        self.report = config.inspect_workflow(self.comfy, self.workflow_file, 'http://127.0.0.1:8199')
-        self.profile = self.report['profile']
+        self.report = config.inspect_workflow(self.comfy, self.workflow_file, 'http://127.0.0.1:8199', self.schemas)
+        self.profile = reviewed_profile(self.report)
         self.profile_path = self.base / 'profile.json'
         common.write_json(self.profile_path, self.profile)
 
@@ -129,54 +130,42 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'First use'):
                 config.load_profile()
 
-    def test_inspect_reads_supplied_values_without_activating(self):
-        self.assertEqual(self.profile['parameters']['first_steps']['value'], 9)
-        self.assertEqual(self.profile['parameters']['upscale']['value'], 1.5)
-        self.assertEqual(self.profile['parameters']['first_resolution']['value'], '720P')
-        self.assertEqual(self.profile['easy_node_id'], '83')
+    def test_inspect_lists_actual_controls_without_activating_defaults(self):
+        self.assertEqual(self.report['profile']['parameters'], {})
+        self.assertEqual(self.report['profile']['bindings'], [])
+        row = next(c for c in self.report['adjustable_controls'] if c['node_id'] == '121')
+        self.assertEqual(row['value'], 9)
         self.assertIsNone(self.profile['reference_short_edge'])
 
-    def test_reviewed_values_and_manual_control_binding(self):
+    def test_confirmed_input_bindings_ignore_titles_and_node_family(self):
         self.profile['parameters']['first_steps']['value'] = 11
         self.workflow['nodes'][2]['title'] = 'My sampling control'
         common.write_json(self.workflow_file, self.workflow)
-        report = config.inspect_workflow(self.comfy, self.workflow_file)
-        self.assertNotIn('first_steps', report['profile']['parameters'])
-        self.assertTrue(any(c['node_id'] == '121' for c in report['adjustable_controls']))
-        config.validate_profile(self.profile)
-        changed = config.apply_parameters(copy.deepcopy(self.workflow), config.task_settings(self.profile))
-        self.assertEqual(config.widgets(config.node_by_id(changed, 121))['value'], 11)
+        config.validate_profile(self.profile, self.schemas)
+        graph, _ = config.load_execution(self.profile, self.schemas)
+        changed = config.apply_parameters(graph, self.profile)
+        self.assertEqual(changed['121']['inputs']['value'], 11)
 
-    def test_setup_cli_inspect_then_save(self):
+    def test_setup_cli_api_inspect_then_confirm_and_save(self):
+        api_path = self.base / 'user_api.json'
+        common.write_json(api_path, execution_graph(self.workflow, self.schemas))
         inspection, saved = self.base / 'inspection.json', self.base / 'saved.json'
         common.command([sys.executable, ROOT/'scripts/setup.py', 'inspect', '--comfyui', self.comfy,
-                        '--workflow', self.workflow_file, '--out', inspection])
+                        '--workflow', api_path, '--out', inspection])
         self.assertFalse(saved.exists())
         report = common.read_json(inspection)
         self.assertIsNone(report['profile']['comfy_url'])
+        report['profile'] = reviewed_profile(report)
         report['profile']['comfy_url'] = 'http://localhost:8199'
         report['profile']['parameters']['second_steps']['value'] = 7
         common.write_json(inspection, report)
         common.command([sys.executable, ROOT/'scripts/setup.py', 'save', '--from', inspection, '--out', saved])
         self.assertEqual(config.load_profile(saved)['parameters']['second_steps']['value'], 7)
 
-    def test_linked_parameter_uses_upstream_value(self):
-        steps = config.node_by_id(self.workflow, 121)
-        upstream = copy.deepcopy(steps)
-        upstream['id'] = 1001
-        upstream['title'] = 'Custom source value'
-        upstream['widgets_values'] = [12]
-        upstream['widgets_values_named'] = {'value': 12}
-        steps['inputs'][0]['link'] = 999
-        self.workflow['nodes'].append(upstream)
-        self.workflow['links'].append([999, 1001, 0, 121, 0, 'INT'])
-        common.write_json(self.workflow_file, self.workflow)
-        report = config.inspect_workflow(self.comfy, self.workflow_file)
-        parameter = report['profile']['parameters']['first_steps']
-        self.assertEqual(parameter['value'], 12)
-        self.assertEqual(parameter['targets'], [{'node_id': '1001', 'widget': 'value'}])
+    def test_binding_linked_input_requires_the_actual_upstream_control(self):
+        self.profile['parameters']['first_steps']['targets'] = [{'node_id': '260', 'input': 'steps'}]
         with self.assertRaisesRegex(ValueError, 'upstream'):
-            config.validate_profile(self.profile)
+            config.validate_profile(self.profile, self.schemas)
 
     def test_frame_padding_and_configurable_reference_size(self):
         self.profile['reference_short_edge'] = 96
@@ -218,7 +207,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(graph['121']['inputs']['value'], 9)
         self.assertEqual(graph['83']['inputs']['ref_image_size'], '2k')
         self.assertEqual(graph['41']['inputs']['model_name'], 'example-user-model')
-        self.assertEqual(jobs[0]['saver'], '519')
+        self.assertEqual(jobs[0]['savers'], ['519'])
         local_h3.run(root, task, client, jobs)
         local_h3.run(root, task, client, jobs)
         self.assertEqual(len(client.posted), 2)
@@ -227,16 +216,88 @@ class PipelineTests(unittest.TestCase):
                             for s in task['segments']))
 
     def test_single_pass_only_and_original_unload(self):
-        self.profile['parameters']['second_pass_enabled']['value'] = False
+        self.workflow, self.schemas = fixture(second=False)
+        common.write_json(self.workflow_file, self.workflow)
+        self.profile = reviewed_profile(self.report, second=False)
         common.write_json(self.profile_path, self.profile)
         root, task = self.task()
         client = FakeComfy(self.schemas, root, task)
         jobs = local_h3.build(root, task, client)
-        self.assertEqual(jobs[0]['saver'], '487')
+        self.assertEqual(jobs[0]['savers'], ['487'])
         self.assertNotIn('333', jobs[0]['graph'])
         self.assertEqual(jobs[0]['graph']['602']['inputs']['video'], ['487', 0])
         local_h3.run(root, task, client, jobs)
         self.assertEqual(len(client.posted), 2)
+
+    def test_other_h3_api_node_family_ids_and_input_names(self):
+        graph = execution_graph(self.workflow, self.schemas)
+        renames = {'83': 'conditioning-other', '519': 'final-video-other'}
+        graph = {renames.get(k, k): n for k, n in graph.items()}
+        for node in graph.values():
+            for key, value in node['inputs'].items():
+                if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
+                    value[0] = renames.get(value[0], value[0])
+        old_kind = graph['conditioning-other']['class_type']
+        new_kind = 'AnotherH3ConditioningImplementation'
+        graph['conditioning-other']['class_type'] = new_kind
+        self.schemas[new_kind] = self.schemas.pop(old_kind)
+        fields = {'prompt': 'positive_caption', 'media_manifest': 'reference_items_json', 'seconds': 'duration_s'}
+        inputs = graph['conditioning-other']['inputs']
+        specs = self.schemas[new_kind]['input']['required']
+        for old, new in fields.items():
+            inputs[new] = inputs.pop(old)
+            specs[new] = specs.pop(old)
+        for entry in list(self.profile['parameters'].values()) + self.profile['bindings']:
+            for target in entry['targets']:
+                if target['node_id'] == '83':
+                    target['input'] = fields.get(target['input'], target['input'])
+                target['node_id'] = renames.get(target['node_id'], target['node_id'])
+        self.profile['output_node_ids'] = ['final-video-other']
+        common.write_json(self.workflow_file, graph)
+        common.write_json(self.profile_path, self.profile)
+        root, task = self.task()
+        client = FakeComfy(self.schemas, root, task)
+        jobs = local_h3.build(root, task, client)
+        configured = jobs[0]['graph']['conditioning-other']['inputs']
+        self.assertEqual(configured['positive_caption'], prompt())
+        self.assertEqual(len(json.loads(configured['reference_items_json'])), 2)
+        self.assertEqual(configured['duration_s'], 39/24)
+        local_h3.run(root, task, client, jobs)
+        self.assertEqual(len(client.posted), 2)
+
+    def test_separate_video_and_image_input_bindings(self):
+        graph = execution_graph(self.workflow, self.schemas)
+        inputs = graph['83']['inputs']
+        inputs.pop('media_manifest')
+        inputs.update(reference_video_file='', character_image_file='')
+        specs = self.schemas[graph['83']['class_type']]['input']['required']
+        specs.pop('media_manifest')
+        specs.update(reference_video_file=['STRING', {}], character_image_file=['STRING', {}])
+        self.profile['bindings'] = [b for b in self.profile['bindings'] if b['source'] != 'media']
+        self.profile['bindings'] += [
+            {'source': 'reference_video', 'path_format': 'absolute',
+             'targets': [{'node_id': '83', 'input': 'reference_video_file'}]},
+            {'source': 'reference_images', 'index': 0,
+             'targets': [{'node_id': '83', 'input': 'character_image_file'}]},
+        ]
+        common.write_json(self.workflow_file, graph)
+        common.write_json(self.profile_path, self.profile)
+        root, task = self.task()
+        client = FakeComfy(self.schemas, root, task)
+        jobs = local_h3.build(root, task, client)
+        actual = jobs[0]['graph']['83']['inputs']
+        self.assertTrue(Path(actual['reference_video_file']).is_file())
+        self.assertTrue(actual['character_image_file'].endswith('/picture_1.png'))
+
+    def test_ui_schema_can_resolve_standard_unnamed_widgets(self):
+        for node in self.workflow['nodes']:
+            node.pop('widgets_values_named', None)
+            for entry in node.get('inputs', []):
+                entry.pop('widget', None)
+        common.write_json(self.workflow_file, self.workflow)
+        root, task = self.task()
+        jobs = local_h3.build(root, task, FakeComfy(self.schemas, root, task))
+        self.assertEqual(jobs[0]['graph']['121']['inputs']['value'], 9)
 
     def test_download_interruption_resumes_same_prompt(self):
         root, task = self.task()

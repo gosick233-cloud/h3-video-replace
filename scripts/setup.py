@@ -18,7 +18,11 @@ def main():
     save.add_argument("--out", default=str(DEFAULT_PROFILE))
     args = parser.parse_args()
     if args.command == "inspect":
-        write_json(args.out, inspect_workflow(args.comfyui, args.workflow, args.comfy_url))
+        schemas = None
+        if args.comfy_url:
+            from local_h3 import LocalComfy
+            schemas = LocalComfy(args.comfy_url).request("/object_info")
+        write_json(args.out, inspect_workflow(args.comfyui, args.workflow, args.comfy_url, schemas))
         print("Inspection saved. Ask the user to confirm controls and defaults; configuration has not been activated.")
     else:
         supplied = read_json(args.source)
