@@ -48,8 +48,12 @@ unmodified sampling configuration remain in the user's workflow.
 Before task preparation, ask whether reference video clips should retain the
 original audio. Then obtain the video, reference images, and replacement map.
 The assistant inspects contact sheets and dense evidence, verifies cuts and
-character identities, splits clips, and writes complete English six-section
-prompts plus an editable Chinese analysis.
+character identities, and makes every real shot change a segment boundary. Each
+generation segment contains one continuous shot. Short shots are padded
+independently rather than merged with neighbors. Long shots may be split further
+at natural action phases or pauses; continuous movement and camera motion are
+not mistaken for cuts. Each prompt contains exactly one `[Shot 1]`, with complete
+English six-section text plus an editable Chinese analysis.
 
 Prepare and show the assets and actual parameters, then ask for rendering
 approval. Rendering is strictly serial, with hidden Windows subprocess windows.
